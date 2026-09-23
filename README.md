@@ -1,12 +1,3 @@
----
-title: Web Search Agent
-emoji: 🔍
-colorFrom: indigo
-colorTo: purple
-sdk: gradio
-app_file: app.py
-pinned: false
----
 
 # Web Search Agent
 
