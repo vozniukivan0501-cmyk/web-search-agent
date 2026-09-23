@@ -1,3 +1,13 @@
+---
+title: Web Search Agent
+emoji: 🔍
+colorFrom: indigo
+colorTo: purple
+sdk: gradio
+app_file: app.py
+pinned: false
+---
+
 # Web Search Agent
 
 A multi-step reasoning web search agent that plans search queries, pulls live web results via DuckDuckGo, filters them with a local Cross-Encoder to save LLM context tokens, scrapes relevant pages, and synthesizes answers with citations using Google Gemini.
