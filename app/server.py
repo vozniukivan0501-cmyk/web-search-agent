@@ -11,7 +11,6 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from app.agent import run_agent, run_agent_stream
-from app.cross_encoder import get_cross_encoder
 from app.config import settings
 
 logging.basicConfig(
@@ -23,10 +22,8 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Pre-load cross-encoder model on startup."""
-    logger.info("Loading Cross-Encoder model on startup...")
-    get_cross_encoder(settings.cross_encoder_model)
-    logger.info("Application ready!")
+    """Application lifespan context. Heavy models are loaded lazily on demand to conserve memory."""
+    logger.info("Application ready and listening for incoming requests.")
     yield
 
 
