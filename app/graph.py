@@ -8,7 +8,7 @@ from llama_index.llms.gemini import Gemini
 from llama_index.core.llms import ChatMessage, MessageRole
 from pydantic import BaseModel, Field, ValidationError
 
-from app.search_tools import search_duckduckgo, search_google, fetch_page_content
+from app.search_tools import search_duckduckgo, fetch_page_content
 from app.cross_encoder import rerank_results
 from app.config import settings
 
@@ -134,26 +134,19 @@ async def search_node(state: AgentState) -> dict:
                 seen.add(url)
                 deduped.append(item)
     
-    fallback_note = []
-    # If 0 results found (e.g. DDG blocked or returns 0 tabs), fallback to top 3 Google results
+    # If sub-queries returned 0 results, search DuckDuckGo directly with original query
     if not deduped:
-        logger.warning(
-            "Search returned 0 results for sub-queries. Falling back to top 3 Google results for: %s",
-            state["original_query"]
-        )
-        google_results = await search_google(state["original_query"], max_results=3)
-        for item in google_results:
+        logger.info("Sub-queries returned 0 results; searching DuckDuckGo with original query: %s", state["original_query"])
+        direct_results = await search_duckduckgo(state["original_query"], max_results=settings.max_search_results)
+        for item in direct_results:
             url = item.get("url")
             if url and url not in seen:
                 seen.add(url)
                 deduped.append(item)
-        if deduped:
-            fallback_note.append(f"[Search Fallback] Using top {len(deduped)} Google results for query")
 
     status_msg = f"Found {len(deduped)} search results, reranking..." if deduped else "No search results found."
     return {
         "search_results": deduped,
-        "reasoning_steps": fallback_note,
         "status": status_msg
     }
 
@@ -176,15 +169,32 @@ async def rerank_node(state: AgentState) -> dict:
         top_k=settings.top_k_reranked
     )
     
+    # Если реранкер нашел 0 валидных вкладок, опираемся на первые 3 вкладки из поиска DuckDuckGo
+    reasoning_steps = []
+    if not ranked and items:
+        logger.info("Reranker found 0 valid tabs, falling back to top 3 search tabs.")
+        ranked = items[:3]
+        reasoning_steps.append(f"[Rerank] Found 0 valid tabs; relying on top {len(ranked)} DuckDuckGo tabs.")
+    elif ranked:
+        reasoning_steps.append(f"[Rerank] Kept top {len(ranked)} of {len(items)} results")
+    else:
+        reasoning_steps.append("[Rerank] 0 valid tabs found.")
+    
     return {
         "reranked_results": ranked,
-        "reasoning_steps": [f"[Rerank] Kept top {len(ranked)} of {len(items)} results"],
+        "reasoning_steps": reasoning_steps,
         "status": f"Fetching content from top {len(ranked)} pages..."
     }
 
 
 async def fetch_node(state: AgentState) -> dict:
     targets = state.get("reranked_results", [])
+    # Если в reranked_results пусто, но есть результаты поиска, берем первые 3 вкладки
+    if not targets:
+        items = state.get("search_results", [])
+        if items:
+            targets = items[:3]
+            
     if not targets:
         logger.info("No URLs to fetch")
         return {
@@ -196,10 +206,18 @@ async def fetch_node(state: AgentState) -> dict:
     tasks = [fetch_page_content(item["url"]) for item in targets]
     pages = await asyncio.gather(*tasks)
     
-    page_contents = [
-        {"title": item.get("title", ""), "url": item.get("url", ""), "content": content}
-        for item, content in zip(targets, pages)
-    ]
+    page_contents = []
+    for item, content in zip(targets, pages):
+        text = content
+        # Если страница вернула ошибку загрузки, используем сниппет вкладки
+        if not text or text.startswith("[Error fetching page"):
+            snippet = item.get("snippet", "")
+            text = f"{snippet}\n{text}" if snippet else text
+        page_contents.append({
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+            "content": text
+        })
     
     return {
         "page_contents": page_contents,
@@ -252,11 +270,11 @@ async def evaluate_node(state: AgentState) -> dict:
     step = state.get("step_count", 1)
     logger.info("Evaluating answer quality (step %d/%d)", step, settings.max_reasoning_steps)
     
-    # If no web sources could be gathered, wrap up immediately rather than looping
-    if not state.get("page_contents"):
+    # Если нет источников или мы уже обработали вкладки, не зацикливаемся
+    if not state.get("page_contents") or step >= 2:
         return {
             "is_complete": True,
-            "reasoning_steps": ["[Evaluate] No live web sources available; finalizing answer."],
+            "reasoning_steps": [f"[Evaluate] Step {step} complete. Finalizing answer."],
             "status": "Answer complete."
         }
     

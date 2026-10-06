@@ -3,7 +3,7 @@
 
 🌐 **Live Demo:** [https://web-search-agent-cwpw.onrender.com/](https://web-search-agent-cwpw.onrender.com/)
 
-A multi-step reasoning web search agent that plans search queries, pulls live web results via DuckDuckGo with Google fallback, filters them with a local Cross-Encoder to save LLM context tokens, scrapes relevant pages, and synthesizes answers with citations using Google Gemini.
+A multi-step reasoning web search agent that plans search queries, pulls live web results via DuckDuckGo, filters them with a local Cross-Encoder to save LLM context tokens, scrapes relevant pages, and synthesizes answers with citations using Google Gemini.
 
 Includes a FastAPI backend with Server-Sent Events (SSE) for streaming graph status updates to a responsive web UI.
 
@@ -48,7 +48,7 @@ Feeding raw search results directly into an LLM wastes input tokens on irrelevan
 - **Orchestration:** LangGraph (state graph & conditional loops)
 - **LLM Integration:** LlamaIndex (`llama-index-llms-gemini`)
 - **Reranker:** Sentence-Transformers (`cross-encoder/ms-marco-MiniLM-L-6-v2`)
-- **Web Search & Scraping:** DuckDuckGo (HTML / Lite API) & Google Search fallback (ads filtered), HTTPX, BeautifulSoup4
+- **Web Search & Scraping:** DuckDuckGo (HTML / Lite API), HTTPX, BeautifulSoup4
 - **Backend:** FastAPI, Uvicorn, SSE-Starlette
 - **Frontend:** Vanilla HTML, CSS, JavaScript (marked.js + highlight.js)
 - **Containerization:** Docker
