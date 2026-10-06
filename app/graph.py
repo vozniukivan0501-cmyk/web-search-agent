@@ -8,7 +8,7 @@ from llama_index.llms.gemini import Gemini
 from llama_index.core.llms import ChatMessage, MessageRole
 from pydantic import BaseModel, Field, ValidationError
 
-from app.search_tools import search_duckduckgo, fetch_page_content
+from app.search_tools import search_duckduckgo, search_google, fetch_page_content
 from app.cross_encoder import rerank_results
 from app.config import settings
 
@@ -134,16 +134,41 @@ async def search_node(state: AgentState) -> dict:
                 seen.add(url)
                 deduped.append(item)
     
+    fallback_note = []
+    # If 0 results found (e.g. DDG blocked or returns 0 tabs), fallback to top 3 Google results
+    if not deduped:
+        logger.warning(
+            "Search returned 0 results for sub-queries. Falling back to top 3 Google results for: %s",
+            state["original_query"]
+        )
+        google_results = await search_google(state["original_query"], max_results=3)
+        for item in google_results:
+            url = item.get("url")
+            if url and url not in seen:
+                seen.add(url)
+                deduped.append(item)
+        if deduped:
+            fallback_note.append(f"[Search Fallback] Using top {len(deduped)} Google results for query")
+
+    status_msg = f"Found {len(deduped)} search results, reranking..." if deduped else "No search results found."
     return {
         "search_results": deduped,
-        "status": f"Found {len(deduped)} search results, reranking..."
+        "reasoning_steps": fallback_note,
+        "status": status_msg
     }
 
 
 async def rerank_node(state: AgentState) -> dict:
-    items = state["search_results"]
-    logger.info("Reranking %d results with cross-encoder", len(items))
+    items = state.get("search_results", [])
+    if not items:
+        logger.info("No search results to rerank")
+        return {
+            "reranked_results": [],
+            "reasoning_steps": ["[Rerank] No search results to rerank"],
+            "status": "No search results found to fetch."
+        }
     
+    logger.info("Reranking %d results with cross-encoder", len(items))
     ranked = rerank_results(
         query=state["original_query"],
         results=items,
@@ -159,9 +184,15 @@ async def rerank_node(state: AgentState) -> dict:
 
 
 async def fetch_node(state: AgentState) -> dict:
-    targets = state["reranked_results"]
-    logger.info("Fetching raw content for %d URLs", len(targets))
+    targets = state.get("reranked_results", [])
+    if not targets:
+        logger.info("No URLs to fetch")
+        return {
+            "page_contents": [],
+            "status": "Synthesizing answer..."
+        }
     
+    logger.info("Fetching raw content for %d URLs", len(targets))
     tasks = [fetch_page_content(item["url"]) for item in targets]
     pages = await asyncio.gather(*tasks)
     
@@ -178,25 +209,37 @@ async def fetch_node(state: AgentState) -> dict:
 
 async def synthesize_node(state: AgentState) -> dict:
     logger.info("Synthesizing answer from sources")
+    pages = state.get("page_contents", [])
     
-    sources = []
-    for idx, page in enumerate(state.get("page_contents", []), start=1):
-        sources.append(
-            f"=== Source {idx}: {page['title']} ===\n"
-            f"URL: {page['url']}\n"
-            f"{page['content']}\n"
+    if pages:
+        sources = []
+        for idx, page in enumerate(pages, start=1):
+            sources.append(
+                f"=== Source {idx}: {page['title']} ===\n"
+                f"URL: {page['url']}\n"
+                f"{page['content']}\n"
+            )
+        system_prompt = (
+            "You are an AI assistant answering questions based on web search results.\n"
+            "Provide a clear, well-structured answer citing your sources.\n"
+            "Answer in the same language as the question."
         )
-    
-    system_prompt = (
-        "You are an AI assistant answering questions based on web search results.\n"
-        "Provide a clear, well-structured answer citing your sources.\n"
-        "Answer in the same language as the question."
-    )
-    user_prompt = (
-        f"Question: {state['original_query']}\n\n"
-        f"Sources:\n{''.join(sources)}\n\n"
-        "Please provide a comprehensive answer with source links."
-    )
+        user_prompt = (
+            f"Question: {state['original_query']}\n\n"
+            f"Sources:\n{''.join(sources)}\n\n"
+            "Please provide a comprehensive answer with source links."
+        )
+    else:
+        system_prompt = (
+            "You are an AI assistant answering questions.\n"
+            "Provide a clear, well-structured answer based on your knowledge.\n"
+            "Answer in the same language as the question."
+        )
+        user_prompt = (
+            f"Question: {state['original_query']}\n\n"
+            "No live web sources could be retrieved. Please provide a helpful, accurate, and comprehensive "
+            "answer based on your knowledge, and briefly mention that web search results were unavailable."
+        )
 
     answer = await llm_generate(state["api_key"], system_prompt, user_prompt)
     return {
@@ -208,6 +251,14 @@ async def synthesize_node(state: AgentState) -> dict:
 async def evaluate_node(state: AgentState) -> dict:
     step = state.get("step_count", 1)
     logger.info("Evaluating answer quality (step %d/%d)", step, settings.max_reasoning_steps)
+    
+    # If no web sources could be gathered, wrap up immediately rather than looping
+    if not state.get("page_contents"):
+        return {
+            "is_complete": True,
+            "reasoning_steps": ["[Evaluate] No live web sources available; finalizing answer."],
+            "status": "Answer complete."
+        }
     
     # Cap loop iterations
     if step >= settings.max_reasoning_steps:
