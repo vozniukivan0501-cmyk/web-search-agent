@@ -119,9 +119,12 @@ async def plan_node(state: AgentState) -> dict:
 
 
 async def search_node(state: AgentState) -> dict:
-    queries = state["sub_queries"]
-    logger.info("Running DDG search for %d queries", len(queries))
+    queries = list(state.get("sub_queries", []))
+    # Always ensure original query is searched as well
+    if state["original_query"] not in queries:
+        queries.append(state["original_query"])
     
+    logger.info("Running web search for %d queries", len(queries))
     tasks = [search_duckduckgo(q, max_results=settings.max_search_results) for q in queries]
     results_lists = await asyncio.gather(*tasks)
     
@@ -134,9 +137,9 @@ async def search_node(state: AgentState) -> dict:
                 seen.add(url)
                 deduped.append(item)
     
-    # If sub-queries returned 0 results, search DuckDuckGo directly with original query
-    if not deduped:
-        logger.info("Sub-queries returned 0 results; searching DuckDuckGo with original query: %s", state["original_query"])
+    # If fewer than 3 results, do a direct search with original query
+    if len(deduped) < 3:
+        logger.info("Fewer than 3 results (%d); searching with original query: %s", len(deduped), state["original_query"])
         direct_results = await search_duckduckgo(state["original_query"], max_results=settings.max_search_results)
         for item in direct_results:
             url = item.get("url")
@@ -154,7 +157,7 @@ async def search_node(state: AgentState) -> dict:
 async def rerank_node(state: AgentState) -> dict:
     items = state.get("search_results", [])
     if not items:
-        logger.info("No search results to rerank")
+        logger.warning("No search results to rerank")
         return {
             "reranked_results": [],
             "reasoning_steps": ["[Rerank] No search results to rerank"],
@@ -165,21 +168,20 @@ async def rerank_node(state: AgentState) -> dict:
     ranked = rerank_results(
         query=state["original_query"],
         results=items,
-        model_name=settings.cross_encoder_model,
         top_k=settings.top_k_reranked
     )
     
-    # Если реранкер нашел 0 валидных вкладок, опираемся на первые 3 вкладки из поиска DuckDuckGo
-    reasoning_steps = []
+    # Ensure we keep up to top_k valid tabs
     if not ranked and items:
-        logger.info("Reranker found 0 valid tabs, falling back to top 3 search tabs.")
-        ranked = items[:3]
-        reasoning_steps.append(f"[Rerank] Found 0 valid tabs; relying on top {len(ranked)} DuckDuckGo tabs.")
-    elif ranked:
-        reasoning_steps.append(f"[Rerank] Kept top {len(ranked)} of {len(items)} results")
-    else:
-        reasoning_steps.append("[Rerank] 0 valid tabs found.")
+        ranked = items[:settings.top_k_reranked]
+    elif len(ranked) < settings.top_k_reranked and len(items) > len(ranked):
+        for it in items:
+            if it not in ranked:
+                ranked.append(it)
+            if len(ranked) >= settings.top_k_reranked:
+                break
     
+    reasoning_steps = [f"[Rerank] Selected top {len(ranked)} most relevant sources."]
     return {
         "reranked_results": ranked,
         "reasoning_steps": reasoning_steps,
@@ -189,12 +191,14 @@ async def rerank_node(state: AgentState) -> dict:
 
 async def fetch_node(state: AgentState) -> dict:
     targets = state.get("reranked_results", [])
-    # Если в reranked_results пусто, но есть результаты поиска, берем первые 3 вкладки
     if not targets:
         items = state.get("search_results", [])
         if items:
-            targets = items[:3]
+            targets = items[:settings.top_k_reranked]
             
+    # Cap to top_k sources
+    targets = targets[:settings.top_k_reranked]
+
     if not targets:
         logger.info("No URLs to fetch")
         return {
@@ -209,10 +213,10 @@ async def fetch_node(state: AgentState) -> dict:
     page_contents = []
     for item, content in zip(targets, pages):
         text = content
-        # Если страница вернула ошибку загрузки, используем сниппет вкладки
+        # Fall back to snippet if page cannot be loaded
         if not text or text.startswith("[Error fetching page"):
             snippet = item.get("snippet", "")
-            text = f"{snippet}\n{text}" if snippet else text
+            text = f"{snippet}\n{text}" if snippet else (item.get("title", "") or "No content available")
         page_contents.append({
             "title": item.get("title", ""),
             "url": item.get("url", ""),
@@ -229,35 +233,39 @@ async def synthesize_node(state: AgentState) -> dict:
     logger.info("Synthesizing answer from sources")
     pages = state.get("page_contents", [])
     
-    if pages:
-        sources = []
-        for idx, page in enumerate(pages, start=1):
-            sources.append(
-                f"=== Source {idx}: {page['title']} ===\n"
-                f"URL: {page['url']}\n"
-                f"{page['content']}\n"
-            )
-        system_prompt = (
-            "You are an AI assistant answering questions based on web search results.\n"
-            "Provide a clear, well-structured answer citing your sources.\n"
-            "Answer in the same language as the question."
+    # If pages is somehow empty, attempt immediate search
+    if not pages:
+        logger.warning("Empty page_contents in synthesize_node; executing emergency search")
+        emergency_items = await search_duckduckgo(state["original_query"], max_results=3)
+        for item in emergency_items[:3]:
+            pages.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "content": item.get("snippet", "")
+            })
+
+    sources = []
+    for idx, page in enumerate(pages[:3], start=1):
+        sources.append(
+            f"=== Источник {idx}: {page['title']} ===\n"
+            f"URL: {page['url']}\n"
+            f"Содержимое:\n{page['content']}\n"
         )
-        user_prompt = (
-            f"Question: {state['original_query']}\n\n"
-            f"Sources:\n{''.join(sources)}\n\n"
-            "Please provide a comprehensive answer with source links."
-        )
-    else:
-        system_prompt = (
-            "You are an AI assistant answering questions.\n"
-            "Provide a clear, well-structured answer based on your knowledge.\n"
-            "Answer in the same language as the question."
-        )
-        user_prompt = (
-            f"Question: {state['original_query']}\n\n"
-            "No live web sources could be retrieved. Please provide a helpful, accurate, and comprehensive "
-            "answer based on your knowledge, and briefly mention that web search results were unavailable."
-        )
+
+    system_prompt = (
+        "Вы — интеллектуальный исследовательский ассистент, который формирует ответы СТРОГО на основе информации из предоставленных интернет-источников.\n"
+        "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО отвечать исключительно из собственной памяти без опоры на предоставленные веб-страницы.\n"
+        "Проанализируйте информацию из первых 3 источников, сформируйте подробный, структурированный и точный ответ, обязательно указывая ссылки на использованные источники (в формате Markdown [Название](URL)).\n"
+        "Отвечайте на том же языке, на котором задан вопрос пользователя."
+    )
+    user_prompt = (
+        f"Вопрос пользователя: {state['original_query']}\n\n"
+        f"Данные из проверенных интернет-источников (первые {len(sources)}):\n\n{''.join(sources)}\n\n"
+        "Требования к ответу:\n"
+        "1. Сформируйте исчерпывающий ответ, опираясь непосредственно на факты и сведения из этих веб-сайтов.\n"
+        "2. Обязательно укажите в тексте или блоке 'Источники' прямые ссылки на использованные сайты в формате Markdown [Название](URL).\n"
+        "3. Ни в коем случае не заявляйте, что поиск в интернете недоступен."
+    )
 
     answer = await llm_generate(state["api_key"], system_prompt, user_prompt)
     return {
