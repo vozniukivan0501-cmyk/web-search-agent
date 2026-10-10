@@ -161,7 +161,7 @@ async def rerank_node(state: AgentState) -> dict:
             "status": "No search results found to fetch."
         }
     
-    logger.info("Reranking %d results with cross-encoder", len(items))
+    logger.info("Reranking %d results", len(items))
     ranked = rerank_results(
         query=state["original_query"],
         results=items,
